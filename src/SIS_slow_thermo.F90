@@ -27,10 +27,12 @@ use SIS_diag_mediator, only : register_diag_field=>register_SIS_diag_field
 use SIS_sum_output, only : SIS_sum_out_CS, write_ice_statistics! , SIS_sum_output_init
 use SIS_sum_output, only : accumulate_bottom_input, accumulate_input_1, accumulate_input_2
 
+use MOM_coms,          only : reproducing_sum
 ! use MOM_domains,       only : pass_var
 ! ! use MOM_dyn_horgrid, only : dyn_horgrid_type, create_dyn_horgrid, destroy_dyn_horgrid
 use MOM_error_handler, only : SIS_error=>MOM_error, FATAL, WARNING, SIS_mesg=>MOM_mesg
 use MOM_error_handler, only : callTree_enter, callTree_leave, callTree_waypoint
+use MOM_error_handler, only : is_root_pe
 use MOM_file_parser, only : get_param, log_param, log_version, param_file_type
 use MOM_hor_index, only : hor_index_type
 use MOM_EOS, only : EOS_type, calculate_density_derivs
@@ -75,7 +77,7 @@ implicit none ; private
 #include <SIS2_memory.h>
 
 public :: slow_thermodynamics, SIS_slow_thermo_init, SIS_slow_thermo_end
-public :: slow_thermo_CS, SIS_slow_thermo_set_ptrs
+public :: slow_thermo_CS, SIS_slow_thermo_set_ptrs, scale_precip_to_nudge_sea_level
 
 !> The control structure for the SIS slow thermodynamics module
 type slow_thermo_CS ; private
@@ -119,6 +121,9 @@ type slow_thermo_CS ; private
                             !!  The default is 1.
   real    :: nudge_conc_tol !< The tolerance for mismatch in the sea ice concentations
                             !! before nudging begins to be applied.
+  real    :: sea_level_nudging_vscale !< If positive, calculate a scaling of precipitation + runoff
+                            !! so that the global sea-level is nudged towards zero at a
+                            !! rate <P+R>/vscale where vscale is this parameter. [m]
 
   logical :: debug          !< If true, write verbose checksums for debugging purposes.
   logical :: column_check   !< If true, enable the heat check column by column.
@@ -477,6 +482,65 @@ subroutine slow_thermodynamics(IST, dt_slow, CS, OSS, FIA, XSF, IOF, G, IG)
                               message="      Post_thermo B ", check_column=.true.)
 
 end subroutine slow_thermodynamics
+
+!~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~!
+!> Scales precipitation and runoff to nudge gobal sea level towards zero.
+subroutine scale_precip_to_nudge_sea_level(CS, FIA, OSS, G, IG)
+  type(slow_thermo_CS),       pointer       :: CS  !< The control structure for the SIS_slow_thermo module
+  type(fast_ice_avg_type),    intent(inout) :: FIA !< A type containing averages of fields
+                                                   !! (mostly fluxes) over the fast updates
+  type(ocean_sfc_state_type), intent(inout) :: OSS !< A structure containing the arrays that describe
+                                                   !! the ocean's surface state for the ice model.
+  type(SIS_hor_grid_type),    intent(inout) :: G   !< The horizontal grid type
+  type(ice_grid_type),        intent(inout) :: IG  !< The sea-ice specific grid type
+  ! Local variables
+ !real, dimension(SZI_(G),SZJ_(G)) :: net_FW ! sum of precip/runoff fields that will be scaled [kg m-2 s-1]
+  real, dimension(SZI_(G),SZJ_(G)) :: tmp, tmp2 ! work arrays for global average calculations
+  real :: ocean_area ! Global sum of ocean area [m2]
+  real :: mean_sea_level ! Spatial average of sea-level from surface state that includes
+                         ! adjustment for weight of sea-ice (i.e. position of sea-level if
+                         ! sea-ice had melted). [m]
+  real :: adjustment_fraction ! perturbation fraction of P+S+R to nudge sea-level to zero. [nondim]
+  real :: multiplier ! multiplier of P,R,S (bounded >=0) [nondim]
+
+  integer :: isc, iec, jsc, jec, ncat, isd, ied, jsd, jed, isr, ier, jsr, jer
+  integer :: i, j, k
+
+  ! This s/r does nothing if this parameter is not positive
+  if (CS%sea_level_nudging_vscale>0.) then
+
+    ! Short hand for loop indexes
+    isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec ; ncat = IG%CatIce
+    isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+    isr = isc-isd+1 ; ier = iec-isd+1 ; jsr = jsc-jsd+1 ; jer = jec-jsd+1
+
+    ! Set the frazil heat flux that remains to be applied. This might need
+    ! to be moved earlier in the algorithm, if there ever to be multiple calls to
+    ! slow_thermodynamics per coupling timestep.
+    do j=jsc,jec ; do i=isc,iec
+      ! Volume of ocean above (below) z=0 [m3]
+      tmp(i,j) = G%mask2dT(i,j) * G%areaT(i,j)
+      tmp2(i,j) = OSS%sea_lev(i,j) * G%mask2dT(i,j) * G%areaT(i,j)
+    enddo ; enddo
+    ! Mean sea-level (relative to z=0 m) [m]
+    ocean_area = reproducing_sum(tmp(:,:), isc, ier, jsr, jer)
+    mean_sea_level = reproducing_sum(tmp2(:,:), isc, ier, jsr, jer) / ocean_area
+    ! Fraction of net_FW to adjust by. [nondim]
+    adjustment_fraction = - mean_sea_level / CS%sea_level_nudging_vscale
+    ! We limit this to be non-negative so that we do not change the sign of forcing.
+    multiplier = max(0., 1. + adjustment_fraction)
+    if (is_root_pe()) write(0,*) 'slow SIS: MSL =', mean_sea_level, 'AF =',adjustment_fraction
+    ! Adjustment that effectively scale net_FW [kg m-2 s-1]
+    do k=1,ncat ; do j=jsc,jec ; do i=isc,iec
+      FIA%lprec_top(i,j,k) = multiplier * FIA%lprec_top(i,j,k)
+      FIA%fprec_top(i,j,k) = multiplier * FIA%fprec_top(i,j,k)
+    enddo ; enddo ; enddo
+    do j=jsc,jec ; do i=isc,iec
+      FIA%runoff(i,j) = multiplier * FIA%runoff(i,j)
+    enddo ; enddo
+  endif
+
+end subroutine scale_precip_to_nudge_sea_level
 
 !~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~!
 !> Add in any excess fluxes due to ice state type into the ice_ocean_flux_type
@@ -1444,6 +1508,17 @@ subroutine SIS_slow_thermo_init(Time, G, IG, param_file, diag, CS, tracer_flow_C
                  "a freshwater flux so as to be destabilizing on net (<1), \n"//&
                  "stabilizing (>1), or neutral (=1).", units="nondim", &
                  default=1.0, do_not_log=.not.CS%nudge_sea_ice)
+  call get_param(param_file, mdl, "SEA_LEVEL_NUDGING_VSCALE", CS%sea_level_nudging_vscale, &
+                 "If positive, calculate a scaling of precipitation + runoff "//&
+                 "so that the global sea-level is nudged towards zero at a "//&
+                 "rate <P+R>/vscale where vscale is this parameter.", &
+                 units="m", default=0.)
+  ! Notes for SEA_LEVEL_NUDGING_VSCALE:
+  !   For a global hydrological cycle of 3 mm/day then these are
+  !  the broad restoring time scales for global mean sea-level:
+  !    SEA_LEVEL_NUDGING_VSCALE = 1.1     has restoring time scale of ~ 1 year
+  !    SEA_LEVEL_NUDGING_VSCALE = 0.9     has restoring time scale of ~ 1 month
+  !    SEA_LEVEL_NUDGING_VSCALE = 0.003   has restoring time scale of ~ 1 day
 
   call get_param(param_file, mdl, "DEBUG", debug, &
                  "If true, write out verbose debugging data.", &

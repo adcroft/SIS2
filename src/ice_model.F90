@@ -103,7 +103,7 @@ use SIS_dyn_trans,   only : SIS_dyn_trans_register_restarts, SIS_dyn_trans_init,
 use SIS_dyn_trans,   only : SIS_dyn_trans_read_alt_restarts, stresses_to_stress_mag
 use SIS_dyn_trans,   only : SIS_dyn_trans_transport_CS, SIS_dyn_trans_sum_output_CS
 use SIS_slow_thermo, only : slow_thermodynamics, SIS_slow_thermo_init, SIS_slow_thermo_end
-use SIS_slow_thermo, only : SIS_slow_thermo_set_ptrs
+use SIS_slow_thermo, only : SIS_slow_thermo_set_ptrs, scale_precip_to_nudge_sea_level
 use SIS_fast_thermo, only : accumulate_deposition_fluxes, convert_frost_to_snow
 use SIS_fast_thermo, only : do_update_ice_model_fast, avg_top_quantities, total_top_quantities
 use SIS_fast_thermo, only : redo_update_ice_model_fast, find_excess_fluxes
@@ -207,6 +207,9 @@ subroutine update_ice_slow_thermo(Ice)
 
     call find_excess_fluxes(FIA, Ice%sCS%TSF, Ice%sCS%XSF, sIST%part_size, sG, sIG)
   endif
+
+  ! Nudge global sea level towards zero by scaling runoff, rain and snow
+  call scale_precip_to_nudge_sea_level(Ice%sCS%slow_thermo_CSp, FIA, Ice%sCS%OSS, sG, sIG)
 
   call convert_frost_to_snow(FIA, sG, sIG)
 
