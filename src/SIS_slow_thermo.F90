@@ -529,7 +529,6 @@ subroutine scale_precip_to_nudge_sea_level(CS, FIA, OSS, G, IG)
     adjustment_fraction = - mean_sea_level / CS%sea_level_nudging_vscale
     ! We limit this to be non-negative so that we do not change the sign of forcing.
     multiplier = max(0., 1. + adjustment_fraction)
-    if (is_root_pe()) write(0,*) 'slow SIS: MSL =', mean_sea_level, 'AF =',adjustment_fraction
     ! Adjustment that effectively scale net_FW [kg m-2 s-1]
     do k=1,ncat ; do j=jsc,jec ; do i=isc,iec
       FIA%lprec_top(i,j,k) = multiplier * FIA%lprec_top(i,j,k)
